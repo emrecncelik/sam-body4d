@@ -17,6 +17,7 @@ def gen_id():
     return f"{t}_{u}"
 
 import argparse
+import gc
 import time
 import cv2
 import glob
@@ -24,6 +25,7 @@ import random
 import numpy as np
 import torch.nn.functional as F
 
+from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -140,13 +142,43 @@ class OfflineApp:
             self.pipeline_mask, self.pipeline_rgb, self.depth_model, self.max_occ_len, self.generator = None, None, None, None, None
         
         self.RUNTIME = {}  # clear any old state
-        self.OUTPUT_DIR = os.path.join(self.CONFIG.runtime['output_dir'], gen_id())
-        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        # Base directory that holds one subdirectory per processed video.
+        # The per-video self.OUTPUT_DIR is set in reset_for_video().
+        self.BASE_OUTPUT_DIR = self.CONFIG.runtime['output_dir']
+        self.OUTPUT_DIR = None
         self.RUNTIME['batch_size'] = self.CONFIG.sam_3d_body.get('batch_size', 1)
         self.RUNTIME['detection_resolution'] = self.CONFIG.completion.get('detection_resolution', [256, 512])
         self.RUNTIME['completion_resolution'] = self.CONFIG.completion.get('completion_resolution', [512, 1024])
         self.RUNTIME['smpl_export'] = self.CONFIG.runtime.get('smpl_export', False)
         self.RUNTIME['bboxes'] = None
+
+    def reset_for_video(self, input_path: str, base_output_dir: str):
+        """
+        Reset all per-video state before processing a new input, while keeping the
+        loaded models intact. Frees the previous tracker inference_state from GPU
+        memory and points OUTPUT_DIR at a fresh per-video subdirectory.
+        """
+        # per-video output subdir, named by the input stem
+        if os.path.isfile(input_path):
+            stem = Path(input_path).stem
+        else:
+            stem = os.path.basename(input_path.rstrip(os.sep))
+        self.OUTPUT_DIR = os.path.join(base_output_dir, stem)
+        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+
+        # drop the previous video's tracker state so GPU memory doesn't accumulate
+        if self.RUNTIME.get('inference_state') is not None:
+            del self.RUNTIME['inference_state']
+            self.RUNTIME['inference_state'] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.RUNTIME['out_obj_ids'] = []
+
+        # re-seed so each video is deterministic, matching a standalone run
+        if self.CONFIG.completion.get('enable', False):
+            self.generator = torch.manual_seed(23)
 
     def on_mask_generation(self, video_path: str=None, start_frame_idx: int = 0, max_frame_num_to_track: int = 1800):
         """
@@ -482,59 +514,41 @@ class OfflineApp:
         return out_4d_path
 
 
-def inference(args):
-    # init configs and cover with cmd options
-    predictor = OfflineApp()
-    if args.output_dir is not None:
-        predictor.OUTPUT_DIR = args.output_dir
-        os.makedirs(predictor.OUTPUT_DIR, exist_ok=True)
+    def process_video(self, input_path: str):
+        """
+        Run the full pipeline (tracking + 4D HMR) on a single input. Assumes
+        reset_for_video() has already been called to set OUTPUT_DIR and clear
+        the previous per-video state.
+        """
+        # human detection on the frame where human FIRST appear
+        if os.path.isfile(input_path) and input_path.endswith(".mp4"):
+            image = read_frame_at(input_path, 0)
+            width, height = image.size
+            for starting_frame_idx in range(10, 100):
+                image = np.array(read_frame_at(input_path, starting_frame_idx))
+                outputs = self.sam3_3d_body_model.process_one_image(image, bbox_thr=0.6,)
+                if len(outputs) > 0:
+                    break
 
-    # human detection on the frame where human FIRST appear
-    if os.path.isfile(args.input_video) and args.input_video.endswith(".mp4"):
-        input_type = "video"
-        image = read_frame_at(args.input_video, 0)
-        width, height = image.size
-        for starting_frame_idx in range(10, 100):
-            image = np.array(read_frame_at(args.input_video, starting_frame_idx))
-            outputs = predictor.sam3_3d_body_model.process_one_image(image, bbox_thr=0.6,)
-            if len(outputs) > 0:
-                break
-        
-        inference_state = predictor.predictor.init_state(video_path=args.input_video)
-        predictor.predictor.clear_all_points_in_video(inference_state)
-        predictor.RUNTIME['inference_state'] = inference_state
-        predictor.RUNTIME['out_obj_ids'] = []
+            inference_state = self.predictor.init_state(video_path=input_path)
 
-        # 1. load bbox (first frame)
-        for obj_id, output in enumerate(outputs):
-            # Let's add a box at (x_min, y_min, x_max, y_max) = (300, 0, 500, 400) to get started
-            xmin, ymin, xmax, ymax = output['bbox']
-            rel_box = [[xmin / width, ymin / height, xmax / width, ymax / height]]
-            rel_box = np.array(rel_box, dtype=np.float32)
-            _, predictor.RUNTIME['out_obj_ids'], low_res_masks, video_res_masks = predictor.predictor.add_new_points_or_box(
-                inference_state=predictor.RUNTIME['inference_state'],
-                frame_idx=starting_frame_idx,
-                obj_id=obj_id+1,
-                box=rel_box,
-            )
+        elif os.path.isdir(input_path):
+            image_list = glob.glob(os.path.join(input_path, '*.jpg'))
+            image_list.sort()
+            image = Image.open(image_list[0]).convert('RGB')
+            width, height = image.size
+            starting_frame_idx = 0
+            for image_path in image_list:
+                outputs = self.sam3_3d_body_model.process_one_image(image_path, bbox_thr=0.6,)
+                if len(outputs) > 0:
+                    break
+                starting_frame_idx += 1
 
-    elif os.path.isdir(args.input_video):
-        input_type = "images"
-        image_list = glob.glob(os.path.join(args.input_video, '*.jpg'))
-        image_list.sort()
-        image = Image.open(image_list[0]).convert('RGB')
-        width, height = image.size
-        starting_frame_idx = 0
-        for image_path in image_list:
-            outputs = predictor.sam3_3d_body_model.process_one_image(image_path, bbox_thr=0.6,)
-            if len(outputs) > 0:
-                break
-            starting_frame_idx += 1
+            inference_state = self.predictor.init_state(video_path=image_list)
 
-        inference_state = predictor.predictor.init_state(video_path=image_list)
-        predictor.predictor.clear_all_points_in_video(inference_state)
-        predictor.RUNTIME['inference_state'] = inference_state
-        predictor.RUNTIME['out_obj_ids'] = []
+        self.predictor.clear_all_points_in_video(inference_state)
+        self.RUNTIME['inference_state'] = inference_state
+        self.RUNTIME['out_obj_ids'] = []
 
         # 1. load bbox (first frame)
         for obj_id, output in enumerate(outputs):
@@ -542,36 +556,30 @@ def inference(args):
             xmin, ymin, xmax, ymax = output['bbox']
             rel_box = [[xmin / width, ymin / height, xmax / width, ymax / height]]
             rel_box = np.array(rel_box, dtype=np.float32)
-            _, predictor.RUNTIME['out_obj_ids'], low_res_masks, video_res_masks = predictor.predictor.add_new_points_or_box(
-                inference_state=predictor.RUNTIME['inference_state'],
+            _, self.RUNTIME['out_obj_ids'], low_res_masks, video_res_masks = self.predictor.add_new_points_or_box(
+                inference_state=self.RUNTIME['inference_state'],
                 frame_idx=starting_frame_idx,
                 obj_id=obj_id+1,
                 box=rel_box,
             )
 
-    # 2. tracking
-    predictor.on_mask_generation(start_frame_idx=0)
-    # 3. hmr upon masks
-    with torch.autocast("cuda", enabled=False):
-        predictor.on_4d_generation()
+        # 2. tracking
+        self.on_mask_generation(start_frame_idx=0)
+        # 3. hmr upon masks
+        with torch.autocast("cuda", enabled=False):
+            self.on_4d_generation()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Offline 4D Body Generation from Videos")
-    parser.add_argument("--output_dir", type=str, help="Path to the output directory")
-    parser.add_argument("--input_video", type=str, required=True, help="Path to the input video (either *.mp4 or a directory containing image sequences)")
-    args = parser.parse_args()
-
-    input_path = args.input_video
+def validate_input(input_path: str):
+    """Validate that an input is an .mp4 file or a directory containing images."""
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"--input_video does not exist: {input_path}")
+        raise FileNotFoundError(f"input does not exist: {input_path}")
     if os.path.isfile(input_path):
         if not input_path.lower().endswith(".mp4"):
             raise ValueError(
-                f"--input_video must be an .mp4 file or a directory, got file: {input_path}"
+                f"input must be an .mp4 file or a directory, got file: {input_path}"
             )
     elif os.path.isdir(input_path):
-        # Optional: check whether the directory contains images
         valid_ext = (".jpg", ".jpeg", ".png", ".bmp")
         images = [
             f for f in os.listdir(input_path)
@@ -579,11 +587,65 @@ if __name__ == "__main__":
         ]
         if len(images) == 0:
             raise ValueError(
-                f"--input_video directory contains no image files: {input_path}"
+                f"input directory contains no image files: {input_path}"
             )
     else:
         raise ValueError(
-            f"--input_video must be an .mp4 file or a directory: {input_path}"
+            f"input must be an .mp4 file or a directory: {input_path}"
         )
+
+
+def collect_inputs(input_dir: str):
+    """
+    Collect the list of inputs from a directory: every *.mp4 file plus every
+    subdirectory that contains image files, returned in sorted order.
+    """
+    valid_ext = (".jpg", ".jpeg", ".png", ".bmp")
+    inputs = sorted(glob.glob(os.path.join(input_dir, "*.mp4")))
+    for entry in sorted(os.listdir(input_dir)):
+        sub = os.path.join(input_dir, entry)
+        if os.path.isdir(sub) and any(
+            f.lower().endswith(valid_ext) for f in os.listdir(sub)
+        ):
+            inputs.append(sub)
+    return inputs
+
+
+def inference(args):
+    # determine the list of inputs to process
+    if args.input_dir is not None:
+        inputs = collect_inputs(args.input_dir)
+        if len(inputs) == 0:
+            raise ValueError(
+                f"--input_dir contains no .mp4 files or image-sequence subdirectories: {args.input_dir}"
+            )
+    else:
+        inputs = [args.input_video]
+
+    # load all models once, then loop over the inputs
+    app = OfflineApp()
+    base_output_dir = args.output_dir if args.output_dir is not None else app.BASE_OUTPUT_DIR
+    os.makedirs(base_output_dir, exist_ok=True)
+
+    for idx, input_path in enumerate(inputs):
+        print(f"[INFO] ({idx + 1}/{len(inputs)}) processing: {input_path}")
+        try:
+            validate_input(input_path)
+            app.reset_for_video(input_path, base_output_dir)
+            app.process_video(input_path)
+            print(f"[INFO] done: {input_path} -> {app.OUTPUT_DIR}")
+        except Exception as e:
+            print(f"[WARN] failed on {input_path}: {e}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Offline 4D Body Generation from Videos")
+    parser.add_argument("--output_dir", type=str, help="Path to the base output directory (one subdir is created per input)")
+    parser.add_argument("--input_video", type=str, help="Path to a single input (either *.mp4 or a directory containing an image sequence)")
+    parser.add_argument("--input_dir", type=str, help="Path to a directory of inputs: each *.mp4 file and each image-sequence subdirectory is processed in turn")
+    args = parser.parse_args()
+
+    if (args.input_video is None) == (args.input_dir is None):
+        raise ValueError("provide exactly one of --input_video or --input_dir")
 
     inference(args)
