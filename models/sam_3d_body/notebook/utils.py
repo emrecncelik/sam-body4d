@@ -236,6 +236,13 @@ def save_mesh_results(
         mesh_path = f"{save_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.ply"
         tmesh.export(mesh_path)
 
+        # Save 3D keypoints
+        _kp = person_output["pred_keypoints_3d"]
+        _kp = _kp.detach().cpu().numpy() if hasattr(_kp, "detach") else np.asarray(_kp)
+        _ct = person_output["pred_cam_t"]
+        _ct = _ct.detach().cpu().numpy() if hasattr(_ct, "detach") else np.asarray(_ct)
+        np.save(f"{save_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}_kp3d.npy", _kp + _ct)
+
         focal_length = {'focal_length': person_output["focal_length"].item(), 'camera': [float(x) for x in person_output['pred_cam_t']]}
         with open(f"{focal_dir}/{pid+1}/{os.path.basename(image_path)[:-4]}.json", "w") as f:
             json.dump(focal_length, f, indent=4)
