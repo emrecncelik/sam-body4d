@@ -625,6 +625,9 @@ def inference(args):
     # load all models once, then loop over the inputs
     app = OfflineApp()
     base_output_dir = args.output_dir if args.output_dir is not None else app.BASE_OUTPUT_DIR
+    # nest batch runs under the input folder's name: <output>/<input_dir_name>/<stem>/
+    if args.input_dir is not None:
+        base_output_dir = os.path.join(base_output_dir, os.path.basename(args.input_dir.rstrip(os.sep)))
     os.makedirs(base_output_dir, exist_ok=True)
 
     for idx, input_path in enumerate(inputs):
